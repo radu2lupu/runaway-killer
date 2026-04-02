@@ -1,0 +1,412 @@
+#!/bin/zsh
+# runaway-killer: Kill orphaned MCP servers and other runaway processes
+#
+# Detection strategy — a process is a candidate MCP server if it matches
+# ANY of these structural signals (no hardcoded names needed):
+#
+#   1. Its parent command is "npm exec" or "npx" (stdio MCP servers)
+#   2. It runs from an npm/npx cache path (~/.npm/_npx/, node_modules/.bin/)
+#   3. It is a direct child of a known AI coding tool (Claude Code, Codex,
+#      Cursor, Windsurf, Zed, Pencil, ...)
+#
+# Once candidates are found, two safety checks decide whether to kill:
+#
+#   A. Broken pipe — the other end of the process's stdin pipe is no longer
+#      held open by any live process (host app closed the session).
+#   B. Excess duplicates — more than MAX_PER_TYPE instances share the same
+#      parent; oldest ones beyond that threshold are killed.
+#
+# Additionally, known resource-hog processes (e.g. orphaned Wine) are killed
+# when their parent app is no longer running.
+#
+# Configuration via environment variables:
+#   RUNAWAY_MAX_PER_TYPE       Max live instances per binary name per parent
+#                              (default: 3)
+#   RUNAWAY_EXTRA_HOSTS        Additional app name patterns to treat as AI
+#                              tool hosts, space-separated (grep -E regexes
+#                              matched against full ps output)
+#   RUNAWAY_DRY_RUN            Set to 1 to preview without killing
+#   RUNAWAY_VERBOSE            Set to 1 for verbose logging
+#   RUNAWAY_LOG                Log file path (default: /tmp/runaway-killer.log)
+
+set -u
+
+VERSION="1.0.0"
+SCRIPT_NAME="${0:t}"
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+show_help() {
+  cat <<'USAGE'
+Usage: runaway-killer [OPTIONS] [COMMAND]
+
+Kill orphaned MCP servers and other runaway processes.
+
+Options:
+  -n, --dry-run     Preview what would be killed without actually killing
+  -v, --verbose     Show detailed candidate detection info
+  -h, --help        Show this help message
+  --version         Show version
+
+Commands:
+  install           Install the launchd agent (runs every 5 minutes)
+  uninstall         Remove the launchd agent
+
+Environment variables:
+  RUNAWAY_MAX_PER_TYPE   Max live instances per MCP server type (default: 3)
+  RUNAWAY_EXTRA_HOSTS    Extra AI host patterns, space-separated
+  RUNAWAY_LOG            Log file path (default: /tmp/runaway-killer.log)
+
+Examples:
+  runaway-killer                    # Run once
+  runaway-killer --dry-run          # Preview without killing
+  runaway-killer install            # Set up launchd to run every 5 min
+  runaway-killer uninstall          # Remove launchd agent
+USAGE
+}
+
+PLIST_LABEL="com.runaway-killer"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+SCRIPT_PATH="${0:A}"
+
+do_install() {
+  if [[ -f "$PLIST_PATH" ]]; then
+    log "Already installed at $PLIST_PATH"
+    log "Run '$SCRIPT_NAME uninstall' first to reinstall."
+    exit 1
+  fi
+  cat > "$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${SCRIPT_PATH}</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/runaway-killer.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/runaway-killer.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null \
+    || launchctl load "$PLIST_PATH" 2>/dev/null
+  echo "Installed and started: $PLIST_PATH"
+  echo "Runs every 5 minutes. Log: /tmp/runaway-killer.log"
+}
+
+do_uninstall() {
+  if [[ ! -f "$PLIST_PATH" ]]; then
+    echo "Not installed (no plist at $PLIST_PATH)"
+    exit 0
+  fi
+  launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null \
+    || launchctl unload "$PLIST_PATH" 2>/dev/null
+  rm -f "$PLIST_PATH"
+  echo "Uninstalled: removed $PLIST_PATH"
+}
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)  RUNAWAY_DRY_RUN=1; shift ;;
+    -v|--verbose)  RUNAWAY_VERBOSE=1; shift ;;
+    -h|--help)     show_help; exit 0 ;;
+    --version)     echo "runaway-killer $VERSION"; exit 0 ;;
+    install)       do_install; exit 0 ;;
+    uninstall)     do_uninstall; exit 0 ;;
+    *)             echo "Unknown option: $1"; show_help; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Zsh guard
+# ---------------------------------------------------------------------------
+if [[ -z "${ZSH_VERSION:-}" ]]; then
+  echo "runaway-killer requires zsh" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+MAX_PER_TYPE=${RUNAWAY_MAX_PER_TYPE:-3}
+DRY_RUN=${RUNAWAY_DRY_RUN:-0}
+VERBOSE=${RUNAWAY_VERBOSE:-0}
+LOG_FILE="${RUNAWAY_LOG:-/tmp/runaway-killer.log}"
+
+# ---------------------------------------------------------------------------
+# Logging — append to log file and rotate if >5000 lines
+# ---------------------------------------------------------------------------
+if [[ -f "$LOG_FILE" ]]; then
+  line_count=$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ')
+  if (( line_count > 5000 )); then
+    tail -1000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+  fi
+fi
+exec 2>>"$LOG_FILE"
+echo "--- $(date '+%Y-%m-%d %H:%M:%S') ---" >&2
+
+log()   { echo "[runaway-killer] $*" >&2; }
+log_v() { [[ "$VERBOSE" == "1" ]] && echo "[runaway-killer] $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Lockfile — prevent concurrent runs
+# ---------------------------------------------------------------------------
+LOCKDIR="/tmp/runaway-killer.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [[ -f "$LOCKDIR/pid" ]] && kill -0 "$(cat "$LOCKDIR/pid" 2>/dev/null)" 2>/dev/null; then
+    log "Another instance running (PID $(cat "$LOCKDIR/pid")), exiting."
+    exit 0
+  fi
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR"
+fi
+echo $$ > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT
+
+# ---------------------------------------------------------------------------
+# kill_pid — graceful SIGTERM then SIGKILL, with PID-recycling guard
+# ---------------------------------------------------------------------------
+kill_pid() {
+  local pid=$1 reason=$2 expected_fragment=${3:-}
+
+  # Guard against PID recycling: verify process still matches
+  local current_cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+  if [[ -z "$current_cmd" ]]; then
+    log_v "  PID $pid already gone — skip"
+    return 1
+  fi
+  if [[ -n "$expected_fragment" ]] && ! echo "$current_cmd" | grep -qF "$expected_fragment"; then
+    log "  PID $pid recycled (expected '$expected_fragment', got '$current_cmd') — skip"
+    return 1
+  fi
+
+  log "  Kill PID $pid — $reason"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    kill -TERM "$pid" 2>/dev/null
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Known AI coding tools that spawn MCP servers.
+# Patterns are grep -E regexes matched against full command strings.
+# Use specific patterns to avoid false positives (e.g. "Zed.app" not "Zed").
+# ---------------------------------------------------------------------------
+AI_HOST_PATTERNS=(
+  "Claude\\.app"
+  "/claude "
+  "/claude$"
+  "Codex\\.app"
+  "Cursor\\.app"
+  "Windsurf\\.app"
+  "Zed\\.app"
+  "Pencil\\.app"
+  "Codeium\\.app"
+  "Aide\\.app"
+  "Continue\\.app"
+)
+# Allow the user to inject extra host patterns
+if [[ -n "${RUNAWAY_EXTRA_HOSTS:-}" ]]; then
+  AI_HOST_PATTERNS+=(${=RUNAWAY_EXTRA_HOSTS})
+fi
+
+log "Scanning processes..."
+
+# ---------------------------------------------------------------------------
+# Step 1 — build the set of AI host PIDs so we can find their children.
+# ---------------------------------------------------------------------------
+ai_host_pids=()
+host_pattern=$(printf '%s|' "${AI_HOST_PATTERNS[@]}")
+host_pattern="${host_pattern%|}"   # trim trailing |
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  pid=$(echo "$line" | awk '{print $1}')
+  # Exclude this script itself
+  [[ "$pid" == "$$" ]] && continue
+  ai_host_pids+=("$pid")
+done < <(ps -eo pid,command | grep -E "$host_pattern" | grep -v "grep -E")
+
+log_v "AI host PIDs: ${ai_host_pids[*]}"
+
+# ---------------------------------------------------------------------------
+# Step 2 — collect candidate MCP server PIDs using structural signals.
+# ---------------------------------------------------------------------------
+declare -A candidate_pids   # pid -> name (for logging)
+declare -A candidate_cmds   # pid -> full command (for PID-recycling guard)
+
+# Signal A: parent is "npm exec" or "npx"
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  pid=$(echo "$line" | awk '{print $1}')
+  ppid=$(echo "$line" | awk '{print $2}')
+  cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')
+  parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+  if echo "$parent_cmd" | grep -qE "^npm exec|^npx "; then
+    name=$(basename "$(echo "$cmd" | awk '{print $1}')")
+    candidate_pids[$pid]="$name (npm exec child)"
+    candidate_cmds[$pid]="$cmd"
+    log_v "  Candidate $pid ($name) — npm exec child"
+  fi
+done < <(ps -eo pid,ppid,command | tail -n +2)
+
+# Signal B: runs from an npm/npx cache path
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  pid=$(echo "$line" | awk '{print $1}')
+  cmd=$(echo "$line" | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}')
+  if echo "$cmd" | grep -qE "\.npm/_npx/|\.npm/bin/|node_modules/\.bin/"; then
+    name=$(basename "$(echo "$cmd" | awk '{print $1}')")
+    candidate_pids[$pid]="${candidate_pids[$pid]:-$name (npx cache)}"
+    candidate_cmds[$pid]="$cmd"
+    log_v "  Candidate $pid ($name) — npx cache path"
+  fi
+done < <(ps -eo pid,command)
+
+# Signal C: direct child of a known AI host AND looks like an MCP binary
+EXCLUDE_BINARIES="zsh|bash|sh|fish|python|ruby|perl|node|npm|npx|deno|git|curl|grep|awk|sed"
+for host_pid in "${ai_host_pids[@]}"; do
+  while IFS= read -r child_pid; do
+    [[ -z "$child_pid" ]] && continue
+    child_cmd=$(ps -p "$child_pid" -o command= 2>/dev/null)
+    child_bin=$(basename "$(echo "$child_cmd" | awk '{print $1}')")
+    # Skip shells, interpreters, and system paths
+    echo "$child_bin" | grep -qE "^($EXCLUDE_BINARIES)$" && continue
+    echo "$child_cmd" | grep -qE "/System/|/usr/lib/|\.framework/" && continue
+    # Only include if the path or binary name contains "mcp" or "server",
+    # but not if the child is itself one of the known AI host apps
+    echo "$child_cmd" | grep -qE "$host_pattern" && continue
+    if echo "$child_cmd" | grep -qiE "mcp|[-_]server"; then
+      candidate_pids[$child_pid]="${candidate_pids[$child_pid]:-$child_bin (host child)}"
+      candidate_cmds[$child_pid]="$child_cmd"
+      log_v "  Candidate $child_pid ($child_bin) — child of host PID $host_pid"
+    fi
+  done < <(pgrep -P "$host_pid" 2>/dev/null)
+done
+
+total_candidates=${#candidate_pids[@]}
+log "Found $total_candidates candidate MCP server process(es)"
+
+# ---------------------------------------------------------------------------
+# Step 3 — collect pipe inodes ONLY if there are candidates to check.
+# This avoids the expensive lsof scan on every run (~2-8s saved).
+# ---------------------------------------------------------------------------
+killed_total=0
+
+if [[ $total_candidates -gt 0 ]]; then
+  log "Checking pipe status for $total_candidates candidate(s)..."
+  all_pipe_inodes=$(lsof -u "$USER" 2>/dev/null \
+    | grep PIPE \
+    | awk '{print $NF}' \
+    | sed 's/^->//' \
+    | sort -u)
+
+  # -------------------------------------------------------------------------
+  # Step 4 — apply kill checks to each candidate.
+  # Sort PIDs numerically ascending (oldest first = kept first for dup check).
+  # -------------------------------------------------------------------------
+  declare -A kept_per_key  # "ppid:name" -> count of kept instances
+
+  for pid in ${(on)${(@k)candidate_pids}}; do
+    name="${candidate_pids[$pid]}"
+    cmd_fragment="${candidate_cmds[$pid]}"
+    ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    [[ -z "$ppid" ]] && continue
+
+    # -- Check A: broken stdin pipe --
+    stdin_other_end=$(lsof -p "$pid" -d 0 2>/dev/null \
+      | grep PIPE \
+      | awk '{print $NF}' \
+      | sed 's/^->//' \
+      | head -1)
+
+    if [[ -n "$stdin_other_end" ]]; then
+      if ! echo "$all_pipe_inodes" | grep -qF -- "$stdin_other_end"; then
+        if kill_pid "$pid" "orphan — broken stdin pipe ($name)" "$cmd_fragment"; then
+          # Clean up npm exec / npx wrapper if now childless
+          parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+          if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
+            remaining=$(pgrep -P "$ppid" 2>/dev/null | wc -l | tr -d ' ')
+            [[ "$remaining" -eq 0 ]] && kill_pid "$ppid" "childless npm exec wrapper" "npm"
+          fi
+          ((killed_total++))
+        fi
+        continue
+      fi
+    fi
+
+    # -- Check B: too many instances of the same MCP server under same ancestor --
+    full_cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+    first_arg=$(echo "$full_cmd" | awk '{print $2}')
+    if [[ -n "$first_arg" && "$first_arg" != -* ]]; then
+      mcp_name=$(basename "$first_arg")
+    else
+      mcp_name=$(basename "$(echo "$full_cmd" | awk '{print $1}')")
+    fi
+    parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+    if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
+      ancestor=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
+    else
+      ancestor="$ppid"
+    fi
+    key="${ancestor}:${mcp_name}"
+    kept=${kept_per_key[$key]:-0}
+    if (( kept >= MAX_PER_TYPE )); then
+      kill_pid "$pid" "excess duplicate ($mcp_name, >$MAX_PER_TYPE per parent)" "$cmd_fragment" \
+        && ((killed_total++))
+    else
+      kept_per_key[$key]=$((kept + 1))
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5 — kill known resource-hog processes that shouldn't linger.
+# These are processes that tend to get orphaned or spin indefinitely.
+# ---------------------------------------------------------------------------
+RUNAWAY_PATTERNS=(
+  "winedevice"
+  "wine64-preloader"
+  "wineserver"
+)
+
+# Only kill Wine processes if CrossOver is not running (i.e. they're orphaned).
+crossover_running=$(pgrep -f "CrossOver" 2>/dev/null)
+
+if [[ -z "$crossover_running" ]]; then
+  for pattern in "${RUNAWAY_PATTERNS[@]}"; do
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      pid=$(echo "$line" | awk '{print $1}')
+      ppid=$(echo "$line" | awk '{print $2}')
+      cpu=$(echo "$line" | awk '{print $3}')
+      # Only kill if orphaned (ppid=1) and using measurable CPU
+      if [[ "$ppid" == "1" ]] && (( ${cpu%.*} >= 1 )); then
+        kill_pid "$pid" "orphaned $pattern (ppid=1, ${cpu}% CPU, CrossOver not running)" "$pattern" \
+          && ((killed_total++))
+      fi
+    done < <(ps -eo pid,ppid,pcpu,comm | grep -i "$pattern" | grep -v "grep -i")
+  done
+else
+  log_v "CrossOver is running — skipping Wine cleanup"
+fi
+
+log "Done. Killed $killed_total process(es)."
