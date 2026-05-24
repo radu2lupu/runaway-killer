@@ -31,7 +31,7 @@
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCRIPT_NAME="${0:t}"
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ show_help() {
   cat <<'USAGE'
 Usage: runaway-killer [OPTIONS] [COMMAND]
 
-Kill orphaned MCP servers and other runaway processes.
+Kill orphaned MCP servers, stale AI helper runtimes, and other runaway processes.
 
 Options:
   -n, --dry-run     Preview what would be killed without actually killing
@@ -180,6 +180,42 @@ echo $$ > "$LOCKDIR/pid"
 trap 'rm -rf "$LOCKDIR"' EXIT
 
 # ---------------------------------------------------------------------------
+# is_known_live_mcp_infrastructure — protect active Codex/OMX MCP transports.
+# These are legitimate long-lived stdio helpers while their parent/wrapper is
+# alive. Stale orphan cleanup is still allowed when the process has no parent.
+# ---------------------------------------------------------------------------
+is_known_live_mcp_infrastructure() {
+  local pid=$1 cmd=${2:-} ppid=${3:-} parent_cmd=${4:-}
+
+  [[ -z "$cmd" ]] && cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+  [[ -z "$ppid" ]] && ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  [[ -z "$parent_cmd" && -n "$ppid" ]] && parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+
+  # If launchd/init owns it, it is no longer an active Codex transport. Let the
+  # regular orphan checks decide whether to reap it.
+  [[ "$ppid" == "1" || -z "$parent_cmd" ]] && return 1
+
+  local looks_like_codex_mcp=1
+  case "$cmd" in
+    *"/oh-my-codex/dist/mcp/"*|*"xcodebuildmcp"*|*"xcodemcp"*|*"mcp-server-darwin-arm64"*|*"grepai mcp-serve"*|*"mcp.cloudflare.com"*|*"mcp.posthog.com"*)
+      looks_like_codex_mcp=0
+      ;;
+  esac
+
+  if [[ "$looks_like_codex_mcp" == "0" ]]; then
+    local host_ancestor=""
+    host_ancestor=$(find_ai_host_ancestor "$pid" 2>/dev/null || true)
+    [[ -n "$host_ancestor" ]] && return 0
+
+    case "$parent_cmd" in
+      *"codex"*|*"Codex.app"*|*"/oh-my-codex/"*) return 0 ;;
+    esac
+  fi
+
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # kill_pid — graceful SIGTERM then SIGKILL, with PID-recycling guard
 # ---------------------------------------------------------------------------
 kill_pid() {
@@ -215,6 +251,9 @@ AI_HOST_PATTERNS=(
   "/claude "
   "/claude$"
   "Codex\\.app"
+  "/codex "
+  "/codex$"
+  "^codex "
   "Cursor\\.app"
   "Windsurf\\.app"
   "Zed\\.app"
@@ -247,24 +286,60 @@ done < <(ps -eo pid,command | grep -E "$host_pattern" | grep -v "grep -E")
 
 log_v "AI host PIDs: ${ai_host_pids[*]}"
 
+# Helper: find a live AI host in the parent chain of PID $1.
+find_ai_host_ancestor() {
+  local current_pid=$1 depth=0 current_cmd=""
+
+  while [[ -n "$current_pid" && "$current_pid" != "0" && $depth -lt 12 ]]; do
+    if [[ -n "${ai_host_pid_set[$current_pid]:-}" ]]; then
+      echo "$current_pid"
+      return 0
+    fi
+
+    current_cmd=$(ps -p "$current_pid" -o command= 2>/dev/null)
+    if [[ -n "$current_cmd" ]] && echo "$current_cmd" | grep -qE "$host_pattern"; then
+      echo "$current_pid"
+      return 0
+    fi
+
+    current_pid=$(ps -p "$current_pid" -o ppid= 2>/dev/null | tr -d ' ')
+    ((depth++))
+  done
+
+  return 1
+}
+
 # ---------------------------------------------------------------------------
-# Step 2 — collect candidate MCP server PIDs using structural signals.
+# Step 2 — collect candidate runaway PIDs using structural signals.
 # ---------------------------------------------------------------------------
-declare -A candidate_pids   # pid -> name (for logging)
-declare -A candidate_cmds   # pid -> full command (for PID-recycling guard)
+declare -A candidate_pids    # pid -> name (for logging)
+declare -A candidate_cmds    # pid -> full command (for PID-recycling guard)
+declare -A candidate_kinds   # pid -> mcp|runtime
+declare -A ai_host_pid_set   # pid -> 1
+
+for host_pid in "${ai_host_pids[@]}"; do
+  ai_host_pid_set[$host_pid]=1
+done
 
 # Signal A: parent is "npm exec" or "npx"
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   pid=$(echo "$line" | awk '{print $1}')
   ppid=$(echo "$line" | awk '{print $2}')
-  cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')
+  cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) {printf "%s", $i; if (i<NF) printf " "} print ""}')
   parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
   if echo "$parent_cmd" | grep -qE "^npm exec|^npx "; then
     name=$(basename "$(echo "$cmd" | awk '{print $1}')")
-    candidate_pids[$pid]="$name (npm exec child)"
+    if echo "$name" | grep -qE "^(node|java)$" && [[ -n "$(find_ai_host_ancestor "$ppid")" ]]; then
+      candidate_pids[$pid]="$name (AI runtime child)"
+      candidate_kinds[$pid]="runtime"
+      log_v "  Candidate $pid ($name) — AI runtime child"
+    else
+      candidate_pids[$pid]="$name (npm exec child)"
+      candidate_kinds[$pid]="mcp"
+      log_v "  Candidate $pid ($name) — npm exec child"
+    fi
     candidate_cmds[$pid]="$cmd"
-    log_v "  Candidate $pid ($name) — npm exec child"
   fi
 done < <(ps -eo pid,ppid,command | tail -n +2)
 
@@ -272,22 +347,37 @@ done < <(ps -eo pid,ppid,command | tail -n +2)
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   pid=$(echo "$line" | awk '{print $1}')
-  cmd=$(echo "$line" | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}')
+  cmd=$(echo "$line" | awk '{for(i=2;i<=NF;i++) {printf "%s", $i; if (i<NF) printf " "} print ""}')
   if echo "$cmd" | grep -qE "\.npm/_npx/|\.npm/bin/|node_modules/\.bin/"; then
     name=$(basename "$(echo "$cmd" | awk '{print $1}')")
-    candidate_pids[$pid]="${candidate_pids[$pid]:-$name (npx cache)}"
+    ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    if echo "$name" | grep -qE "^(node|java)$" && [[ -n "$(find_ai_host_ancestor "$ppid")" ]]; then
+      candidate_pids[$pid]="${candidate_pids[$pid]:-$name (AI runtime cache)}"
+      candidate_kinds[$pid]="${candidate_kinds[$pid]:-runtime}"
+      log_v "  Candidate $pid ($name) — AI runtime cache path"
+    else
+      candidate_pids[$pid]="${candidate_pids[$pid]:-$name (npx cache)}"
+      candidate_kinds[$pid]="${candidate_kinds[$pid]:-mcp}"
+      log_v "  Candidate $pid ($name) — npx cache path"
+    fi
     candidate_cmds[$pid]="$cmd"
-    log_v "  Candidate $pid ($name) — npx cache path"
   fi
 done < <(ps -eo pid,command)
 
-# Signal C: direct child of a known AI host AND looks like an MCP binary
+# Signal C: direct child of a known AI host AND looks like a helper runtime or MCP binary
 EXCLUDE_BINARIES="zsh|bash|sh|fish|python|ruby|perl|node|npm|npx|deno|git|curl|grep|awk|sed"
 for host_pid in "${ai_host_pids[@]}"; do
   while IFS= read -r child_pid; do
     [[ -z "$child_pid" ]] && continue
     child_cmd=$(ps -p "$child_pid" -o command= 2>/dev/null)
     child_bin=$(basename "$(echo "$child_cmd" | awk '{print $1}')")
+    if echo "$child_bin" | grep -qE "^(node|java)$"; then
+      candidate_pids[$child_pid]="${candidate_pids[$child_pid]:-$child_bin (host runtime)}"
+      candidate_cmds[$child_pid]="$child_cmd"
+      candidate_kinds[$child_pid]="runtime"
+      log_v "  Candidate $child_pid ($child_bin) — child runtime of host PID $host_pid"
+      continue
+    fi
     # Skip shells, interpreters, and system paths
     echo "$child_bin" | grep -qE "^($EXCLUDE_BINARIES)$" && continue
     echo "$child_cmd" | grep -qE "/System/|/usr/lib/|\.framework/" && continue
@@ -297,13 +387,14 @@ for host_pid in "${ai_host_pids[@]}"; do
     if echo "$child_cmd" | grep -qiE "mcp|[-_]server"; then
       candidate_pids[$child_pid]="${candidate_pids[$child_pid]:-$child_bin (host child)}"
       candidate_cmds[$child_pid]="$child_cmd"
+      candidate_kinds[$child_pid]="mcp"
       log_v "  Candidate $child_pid ($child_bin) — child of host PID $host_pid"
     fi
   done < <(pgrep -P "$host_pid" 2>/dev/null)
 done
 
 total_candidates=${#candidate_pids[@]}
-log "Found $total_candidates candidate MCP server process(es)"
+log "Found $total_candidates candidate runaway process(es)"
 
 # ---------------------------------------------------------------------------
 # Step 3 — collect pipe inodes ONLY if there are candidates to check.
@@ -328,28 +419,59 @@ if [[ $total_candidates -gt 0 ]]; then
   for pid in ${(on)${(@k)candidate_pids}}; do
     name="${candidate_pids[$pid]}"
     cmd_fragment="${candidate_cmds[$pid]}"
+    kind="${candidate_kinds[$pid]:-mcp}"
     ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
     [[ -z "$ppid" ]] && continue
+    parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+
+    local is_live_infra=0
+    if is_known_live_mcp_infrastructure "$pid" "$cmd_fragment" "$ppid" "$parent_cmd"; then
+      is_live_infra=1
+      log_v "  Live infra PID $pid ($name) — dedup-only (skip orphan check)"
+    fi
+
+    if [[ "$kind" == "runtime" ]]; then
+      host_ancestor=$(find_ai_host_ancestor "$pid")
+
+      if [[ "$ppid" == "1" || -z "$parent_cmd" ]]; then
+        kill_pid "$pid" "orphaned AI runtime helper ($name)" "$cmd_fragment" \
+          && ((killed_total++))
+        continue
+      fi
+
+      if [[ -z "$host_ancestor" ]]; then
+        kill_pid "$pid" "detached AI runtime helper (no live AI host ancestor: $name)" "$cmd_fragment" \
+          && ((killed_total++))
+        continue
+      fi
+
+      # Has a live AI host — protect from orphan/pipe checks, but still let
+      # dedup (Check B) cap how many can accumulate under the same ancestor.
+      is_live_infra=1
+    fi
 
     # -- Check A: broken stdin pipe --
-    stdin_other_end=$(lsof -p "$pid" -d 0 2>/dev/null \
-      | grep PIPE \
-      | awk '{print $NF}' \
-      | sed 's/^->//' \
-      | head -1)
+    # Skipped for live-infra MCP transports — they have a legitimate live host;
+    # dedup (Check B) still applies to cap accumulation.
+    if [[ "$is_live_infra" != "1" ]]; then
+      stdin_other_end=$(lsof -p "$pid" -d 0 2>/dev/null \
+        | grep PIPE \
+        | awk '{print $NF}' \
+        | sed 's/^->//' \
+        | head -1)
 
-    if [[ -n "$stdin_other_end" ]]; then
-      if ! echo "$all_pipe_inodes" | grep -qF -- "$stdin_other_end"; then
-        if kill_pid "$pid" "orphan — broken stdin pipe ($name)" "$cmd_fragment"; then
-          # Clean up npm exec / npx wrapper if now childless
-          parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
-          if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
-            remaining=$(pgrep -P "$ppid" 2>/dev/null | wc -l | tr -d ' ')
-            [[ "$remaining" -eq 0 ]] && kill_pid "$ppid" "childless npm exec wrapper" "npm"
+      if [[ -n "$stdin_other_end" ]]; then
+        if ! echo "$all_pipe_inodes" | grep -qF -- "$stdin_other_end"; then
+          if kill_pid "$pid" "orphan — broken stdin pipe ($name)" "$cmd_fragment"; then
+            # Clean up npm exec / npx wrapper if now childless
+            if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
+              remaining=$(pgrep -P "$ppid" 2>/dev/null | wc -l | tr -d ' ')
+              [[ "$remaining" -eq 0 ]] && kill_pid "$ppid" "childless npm exec wrapper" "npm"
+            fi
+            ((killed_total++))
           fi
-          ((killed_total++))
+          continue
         fi
-        continue
       fi
     fi
 
@@ -361,8 +483,13 @@ if [[ $total_candidates -gt 0 ]]; then
     else
       mcp_name=$(basename "$(echo "$full_cmd" | awk '{print $1}')")
     fi
-    parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
-    if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
+    if [[ "$is_live_infra" == "1" ]]; then
+      # Cap accumulation across all sub-conversations under the same AI host
+      # (e.g. one Codex.app or one cmux claude session can hoard duplicates
+      # via stale child processes whose immediate parents still differ).
+      ancestor=$(find_ai_host_ancestor "$pid" 2>/dev/null || true)
+      [[ -z "$ancestor" ]] && ancestor="$ppid"
+    elif echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
       ancestor=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
     else
       ancestor="$ppid"
@@ -408,5 +535,25 @@ if [[ -z "$crossover_running" ]]; then
 else
   log_v "CrossOver is running — skipping Wine cleanup"
 fi
+
+# ---------------------------------------------------------------------------
+# Step 6 — kill orphaned `codex exec` one-shots that never exited.
+# These are direct children of launchd (ppid=1) running with the ephemeral
+# bypass-approvals flag; they were meant to be one-shot invocations and any
+# MCP servers they spawned will be cleaned up alongside them.
+#
+# We use pgrep instead of parsing `ps … command` directly because the
+# command line for these processes embeds the multi-line distiller prompt
+# (real newline characters), which breaks any line-oriented parse of ps.
+# ---------------------------------------------------------------------------
+for pid in $(pgrep -f '^codex exec' 2>/dev/null); do
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  [[ "$ppid" == "1" ]] || continue
+  # Normalize newlines so the flag check matches even when ps preserves them.
+  cmd=$(ps -p "$pid" -o command= 2>/dev/null | tr '\n' ' ')
+  echo "$cmd" | grep -qE -- "--ephemeral|--dangerously-bypass-approvals" || continue
+  kill_pid "$pid" "orphaned codex exec (ppid=1, ephemeral one-shot)" "codex exec" \
+    && ((killed_total++))
+done
 
 log "Done. Killed $killed_total process(es)."
