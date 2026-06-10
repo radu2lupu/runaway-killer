@@ -1,10 +1,10 @@
 # runaway-killer
 
-A lightweight macOS daemon that finds and kills orphaned processes draining your battery. Built for developers using AI coding tools (Claude Code, Cursor, Windsurf, Copilot, etc.) where background MCP servers frequently outlive their parent sessions.
+A lightweight macOS daemon that finds and kills orphaned processes draining your battery. Built for developers using AI coding tools (Claude Code, Cursor, Windsurf, Copilot, etc.) where background MCP servers and helper runtimes can outlive their parent sessions.
 
 ## The problem
 
-AI coding tools spawn MCP (Model Context Protocol) server processes to extend their capabilities. When you close a session, these servers often keep running — silently eating CPU in the background. On a laptop, a handful of orphaned MCP servers can cut your battery life in half.
+AI coding tools spawn MCP (Model Context Protocol) server processes to extend their capabilities. They also often spin up helper `node` and `java` runtimes through `npm exec`, `npx`, or app-hosted subprocess trees. When you close a session, these helpers can keep running — silently eating CPU and memory in the background. On a laptop, a handful of orphaned helpers can cut your battery life in half.
 
 The same happens with other tools: Wine/CrossOver leaves behind `winedevice.exe` processes, Electron apps leave orphaned helpers, and so on.
 

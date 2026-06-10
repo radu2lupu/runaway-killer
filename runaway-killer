@@ -19,19 +19,28 @@
 # Additionally, known resource-hog processes (e.g. orphaned Wine) are killed
 # when their parent app is no longer running.
 #
+# Idle iOS/watchOS simulators are also shut down: automated test tooling boots
+# simulators per run and routinely leaks them, and each booted simulator runs a
+# full guest userland (~250-300 daemons) that exhausts RAM/swap.
+#
 # Configuration via environment variables:
 #   RUNAWAY_MAX_PER_TYPE       Max live instances per binary name per parent
 #                              (default: 3)
 #   RUNAWAY_EXTRA_HOSTS        Additional app name patterns to treat as AI
 #                              tool hosts, space-separated (grep -E regexes
 #                              matched against full ps output)
+#   RUNAWAY_SIM_REAP           Shut down idle simulators (default: 1; 0 disables)
+#   RUNAWAY_SIM_MIN_UPTIME_SEC Min simulator uptime before it is eligible to be
+#                              reaped (default: 7200 = 2h)
+#   RUNAWAY_SIM_IDLE_SEC       A simulator with a guest app launched within this
+#                              many seconds is left alone (default: 1800 = 30m)
 #   RUNAWAY_DRY_RUN            Set to 1 to preview without killing
 #   RUNAWAY_VERBOSE            Set to 1 for verbose logging
 #   RUNAWAY_LOG                Log file path (default: /tmp/runaway-killer.log)
 
 set -u
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 SCRIPT_NAME="${0:t}"
 
 # ---------------------------------------------------------------------------
@@ -54,9 +63,12 @@ Commands:
   uninstall         Remove the launchd agent
 
 Environment variables:
-  RUNAWAY_MAX_PER_TYPE   Max live instances per MCP server type (default: 3)
-  RUNAWAY_EXTRA_HOSTS    Extra AI host patterns, space-separated
-  RUNAWAY_LOG            Log file path (default: /tmp/runaway-killer.log)
+  RUNAWAY_MAX_PER_TYPE       Max live instances per MCP server type (default: 3)
+  RUNAWAY_EXTRA_HOSTS        Extra AI host patterns, space-separated
+  RUNAWAY_SIM_REAP           Shut down idle simulators (default: 1; 0 disables)
+  RUNAWAY_SIM_MIN_UPTIME_SEC Min simulator uptime before reaping (default: 7200)
+  RUNAWAY_SIM_IDLE_SEC       Keep sims with an app launched within N sec (default: 1800)
+  RUNAWAY_LOG                Log file path (default: /tmp/runaway-killer.log)
 
 Examples:
   runaway-killer                    # Run once
@@ -555,5 +567,85 @@ for pid in $(pgrep -f '^codex exec' 2>/dev/null); do
   kill_pid "$pid" "orphaned codex exec (ppid=1, ephemeral one-shot)" "codex exec" \
     && ((killed_total++))
 done
+
+# ---------------------------------------------------------------------------
+# Step 7 — shut down idle iOS/watchOS simulators.
+#
+# Automated test tooling (Codex, xcodebuild, MCP servers) boots simulators per
+# run and frequently never shuts them down. Each booted simulator runs a full
+# guest userland (~250-300 daemons), so a few leaked sims exhaust RAM/swap and
+# drive load average into the hundreds.
+#
+# A booted simulator is reaped only when ALL of these hold:
+#   * its launchd_sim has been up longer than SIM_MIN_UPTIME_SEC
+#   * no guest app has launched within the last SIM_IDLE_SEC seconds (a fresh
+#     app launch => a test is actively running => leave it alone)
+#   * no debugger (debugserver/lldb-rpc-server) is attached to that device
+# ---------------------------------------------------------------------------
+SIM_REAP=${RUNAWAY_SIM_REAP:-1}
+SIM_MIN_UPTIME_SEC=${RUNAWAY_SIM_MIN_UPTIME_SEC:-7200}
+SIM_IDLE_SEC=${RUNAWAY_SIM_IDLE_SEC:-1800}
+
+# Convert a ps etime field ([[dd-]hh:]mm:ss) to seconds. Empty/garbage -> 0.
+etime_to_sec() {
+  local e="${1//[[:space:]]/}" days=0 hh=0 mm=0 ss=0 rest
+  [[ -z "$e" ]] && { echo 0; return; }
+  if [[ "$e" == *-* ]]; then days="${e%%-*}"; rest="${e#*-}"; else rest="$e"; fi
+  local parts=("${(@s/:/)rest}")
+  case ${#parts} in
+    3) hh=${parts[1]}; mm=${parts[2]}; ss=${parts[3]} ;;
+    2) mm=${parts[1]}; ss=${parts[2]} ;;
+    *) ss=${parts[1]:-0} ;;
+  esac
+  echo $(( 10#${days:-0}*86400 + 10#${hh:-0}*3600 + 10#${mm:-0}*60 + 10#${ss:-0} ))
+}
+
+if [[ "$SIM_REAP" == "1" ]] && command -v xcrun >/dev/null 2>&1; then
+  log "Checking for idle simulators..."
+  # Each booted device has a launchd_sim whose argument embeds the device UDID:
+  #   .../Devices/<UDID>/data/var/run/launchd_bootstrap.plist
+  while IFS= read -r sim_line; do
+    [[ -z "$sim_line" ]] && continue
+    sim_etime=$(echo "$sim_line" | awk '{print $1}')
+    sim_udid=$(echo "$sim_line" | sed -nE 's#.*/Devices/([0-9A-Fa-f-]+)/data/var/run/launchd_bootstrap\.plist.*#\1#p')
+    [[ -z "$sim_udid" ]] && continue
+
+    sim_uptime=$(etime_to_sec "$sim_etime")
+    if (( sim_uptime < SIM_MIN_UPTIME_SEC )); then
+      log_v "  Sim $sim_udid up ${sim_uptime}s (< ${SIM_MIN_UPTIME_SEC}s) — keep"
+      continue
+    fi
+
+    # Youngest guest-app launch for this device (lowest etime, in seconds).
+    sim_youngest=""
+    while IFS= read -r app_etime; do
+      [[ -z "$app_etime" ]] && continue
+      app_age=$(etime_to_sec "$app_etime")
+      if [[ -z "$sim_youngest" || "$app_age" -lt "$sim_youngest" ]]; then
+        sim_youngest=$app_age
+      fi
+    done < <(ps -axo etime,command | grep "Devices/$sim_udid/data/Containers/Bundle/Application" | grep -v grep | awk '{print $1}')
+
+    if [[ -n "$sim_youngest" ]] && (( sim_youngest < SIM_IDLE_SEC )); then
+      log_v "  Sim $sim_udid active (app launched ${sim_youngest}s ago) — keep"
+      continue
+    fi
+
+    # Debugger attached to this device? (debugserver/lldb-rpc-server reference
+    # the device UDID via the app's data-container path.)
+    if ps -axo command | grep -E "debugserver|lldb-rpc-server" | grep -v grep | grep -q "$sim_udid"; then
+      log_v "  Sim $sim_udid has a debugger attached — keep"
+      continue
+    fi
+
+    sim_name=$(xcrun simctl list devices booted 2>/dev/null | grep "$sim_udid" | sed -E 's/ *\(.*//; s/^ *//')
+    log "  Shutdown idle simulator ${sim_name:-$sim_udid} (up ${sim_uptime}s, no app launch in last ${SIM_IDLE_SEC}s)"
+    if [[ "$DRY_RUN" != "1" ]]; then
+      xcrun simctl shutdown "$sim_udid" 2>/dev/null && ((killed_total++))
+    else
+      ((killed_total++))
+    fi
+  done < <(ps -axo etime,command | grep "launchd_sim" | grep "launchd_bootstrap.plist" | grep -v grep)
+fi
 
 log "Done. Killed $killed_total process(es)."
